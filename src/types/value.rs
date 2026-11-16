@@ -1,8 +1,9 @@
-//! Types de valeurs supportés par les gènes
+//! Types de valeurs supportés par les gènes.
 
-use std::io::{Read, Write};
+use crate::util::{invalid_data, read_len_bytes, read_string, read_u8, write_len_bytes};
+use std::io::{self, Read, Write};
 
-/// Type de valeur pour un gène
+/// Valeur portée par un gène.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     /// Entier 64 bits
@@ -13,14 +14,14 @@ pub enum Value {
     String(String),
     /// Booléen
     Bool(bool),
-    /// Bytes bruts
+    /// Octets bruts
     Bytes(Vec<u8>),
-    /// Null
+    /// Valeur nulle
     Null,
 }
 
 impl Value {
-    /// Retourne le type discriminant
+    /// Discriminant utilisé dans le format binaire.
     pub fn type_id(&self) -> u8 {
         match self {
             Value::Int(_) => 0,
@@ -32,79 +33,125 @@ impl Value {
         }
     }
 
-    /// Taille approximative en bytes
-    pub fn size_bytes(&self) -> usize {
+    /// Nom lisible du type.
+    pub fn type_name(&self) -> &'static str {
         match self {
-            Value::Int(_) => 8,
-            Value::Float(_) => 8,
-            Value::String(s) => s.len(),
+            Value::Int(_) => "int",
+            Value::Float(_) => "float",
+            Value::String(_) => "string",
+            Value::Bool(_) => "bool",
+            Value::Bytes(_) => "bytes",
+            Value::Null => "null",
+        }
+    }
+
+    /// Taille exacte en octets de la valeur une fois sérialisée (type inclus).
+    pub fn size_bytes(&self) -> usize {
+        1 + match self {
+            Value::Int(_) | Value::Float(_) => 8,
+            Value::String(s) => 4 + s.len(),
             Value::Bool(_) => 1,
-            Value::Bytes(b) => b.len(),
+            Value::Bytes(b) => 4 + b.len(),
             Value::Null => 0,
         }
     }
 
-    /// Sérialise la valeur dans un writer
-    pub fn serialize<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
+    /// Sérialise la valeur dans un writer.
+    pub fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         writer.write_all(&[self.type_id()])?;
         match self {
-            Value::Int(v) => writer.write_all(&v.to_le_bytes())?,
-            Value::Float(v) => writer.write_all(&v.to_le_bytes())?,
-            Value::String(s) => {
-                let len = s.len() as u32;
-                writer.write_all(&len.to_le_bytes())?;
-                writer.write_all(s.as_bytes())?;
-            }
-            Value::Bool(v) => writer.write_all(&[*v as u8])?,
-            Value::Bytes(b) => {
-                let len = b.len() as u32;
-                writer.write_all(&len.to_le_bytes())?;
-                writer.write_all(b)?;
-            }
-            Value::Null => {}
+            Value::Int(v) => writer.write_all(&v.to_le_bytes()),
+            Value::Float(v) => writer.write_all(&v.to_le_bytes()),
+            Value::String(s) => write_len_bytes(writer, s.as_bytes()),
+            Value::Bool(v) => writer.write_all(&[*v as u8]),
+            Value::Bytes(b) => write_len_bytes(writer, b),
+            Value::Null => Ok(()),
         }
-        Ok(())
     }
 
-    /// Désérialise une valeur depuis un reader
-    pub fn deserialize<R: Read>(reader: &mut R) -> std::io::Result<Self> {
-        let mut type_byte = [0u8; 1];
-        reader.read_exact(&mut type_byte)?;
-        
-        match type_byte[0] {
+    /// Désérialise une valeur depuis un reader.
+    pub fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
+        match read_u8(reader)? {
             0 => {
-                let mut bytes = [0u8; 8];
-                reader.read_exact(&mut bytes)?;
-                Ok(Value::Int(i64::from_le_bytes(bytes)))
+                let mut b = [0u8; 8];
+                reader.read_exact(&mut b)?;
+                Ok(Value::Int(i64::from_le_bytes(b)))
             }
             1 => {
-                let mut bytes = [0u8; 8];
-                reader.read_exact(&mut bytes)?;
-                Ok(Value::Float(f64::from_le_bytes(bytes)))
+                let mut b = [0u8; 8];
+                reader.read_exact(&mut b)?;
+                Ok(Value::Float(f64::from_le_bytes(b)))
             }
-            2 => {
-                let mut len_bytes = [0u8; 4];
-                reader.read_exact(&mut len_bytes)?;
-                let len = u32::from_le_bytes(len_bytes) as usize;
-                let mut string_bytes = vec![0u8; len];
-                reader.read_exact(&mut string_bytes)?;
-                Ok(Value::String(String::from_utf8(string_bytes).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid UTF-8"))?))
-            }
-            3 => {
-                let mut byte = [0u8; 1];
-                reader.read_exact(&mut byte)?;
-                Ok(Value::Bool(byte[0] != 0))
-            }
-            4 => {
-                let mut len_bytes = [0u8; 4];
-                reader.read_exact(&mut len_bytes)?;
-                let len = u32::from_le_bytes(len_bytes) as usize;
-                let mut bytes = vec![0u8; len];
-                reader.read_exact(&mut bytes)?;
-                Ok(Value::Bytes(bytes))
-            }
+            2 => Ok(Value::String(read_string(reader)?)),
+            3 => Ok(Value::Bool(read_u8(reader)? != 0)),
+            4 => Ok(Value::Bytes(read_len_bytes(reader)?)),
             5 => Ok(Value::Null),
-            _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Unknown value type")),
+            _ => Err(invalid_data("Type de valeur inconnu")),
         }
+    }
+}
+
+impl From<i64> for Value {
+    fn from(v: i64) -> Self {
+        Value::Int(v)
+    }
+}
+
+impl From<f64> for Value {
+    fn from(v: f64) -> Self {
+        Value::Float(v)
+    }
+}
+
+impl From<bool> for Value {
+    fn from(v: bool) -> Self {
+        Value::Bool(v)
+    }
+}
+
+impl From<&str> for Value {
+    fn from(v: &str) -> Self {
+        Value::String(v.to_string())
+    }
+}
+
+impl From<String> for Value {
+    fn from(v: String) -> Self {
+        Value::String(v)
+    }
+}
+
+impl From<Vec<u8>> for Value {
+    fn from(v: Vec<u8>) -> Self {
+        Value::Bytes(v)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip(v: Value) {
+        let mut buf = Vec::new();
+        v.serialize(&mut buf).unwrap();
+        assert_eq!(buf.len(), v.size_bytes());
+        let back = Value::deserialize(&mut buf.as_slice()).unwrap();
+        assert_eq!(v, back);
+    }
+
+    #[test]
+    fn all_variants_roundtrip() {
+        roundtrip(Value::Int(-42));
+        roundtrip(Value::Float(3.5));
+        roundtrip(Value::String("héllo".to_string()));
+        roundtrip(Value::Bool(true));
+        roundtrip(Value::Bytes(vec![1, 2, 3]));
+        roundtrip(Value::Null);
+    }
+
+    #[test]
+    fn unknown_type_is_rejected() {
+        let data = [99u8];
+        assert!(Value::deserialize(&mut &data[..]).is_err());
     }
 }

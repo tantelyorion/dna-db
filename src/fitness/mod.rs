@@ -1,4 +1,4 @@
-//! Système de fitness pour la sélection naturelle
+//! Système de fitness pour la sélection naturelle.
 
 mod calculator;
 

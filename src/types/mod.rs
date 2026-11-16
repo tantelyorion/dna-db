@@ -1,11 +1,11 @@
-//! Types fondamentaux de DNA DB
+//! Types fondamentaux de DNA DB : valeurs, gènes, chromosomes et genomes.
 
-mod value;
-mod gene;
 mod chromosome;
+mod gene;
 mod genome;
+mod value;
 
-pub use value::Value;
-pub use gene::{Gene, GeneId};
 pub use chromosome::{Chromosome, ChromosomeId};
-pub use genome::{Genome, GenomeId, FitnessScore, MemoryStatus};
+pub use gene::{Gene, GeneId};
+pub use genome::{FitnessScore, Genome, GenomeId, MemoryStatus};
+pub use value::Value;

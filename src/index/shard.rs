@@ -1,112 +1,108 @@
-//! Sharding pour le multi-threading
+//! Shards : l'index est réparti pour limiter la contention entre threads.
 
-use crate::types::*;
-use crate::fitness::FitnessScore;
+use super::signature::GeneticSignature;
+use crate::types::{FitnessScore, GenomeId, MemoryStatus};
 use parking_lot::RwLock;
-use std::collections::{HashMap, BTreeMap};
+use std::collections::{BTreeSet, HashMap};
 
-/// Nombre de shards (puissance de 2 pour modulo rapide)
+/// Nombre de shards.
 pub const SHARD_COUNT: usize = 256;
 
-/// Un shard contenant une partie des genomes
+/// Métadonnées légères d'un genome : l'index ne conserve plus de copie du genome entier.
+#[derive(Debug, Clone, Copy)]
+pub struct GenomeMeta {
+    /// Identifiant
+    pub id: GenomeId,
+    /// Parent éventuel
+    pub parent_id: Option<GenomeId>,
+    /// Génération
+    pub generation: u64,
+    /// Fitness
+    pub fitness: FitnessScore,
+    /// Signature de similarité
+    pub signature: GeneticSignature,
+    /// Statut mémoire
+    pub memory_status: MemoryStatus,
+}
+
+struct ShardInner {
+    metas: HashMap<GenomeId, GenomeMeta>,
+    by_fitness: BTreeSet<(FitnessScore, GenomeId)>,
+}
+
+/// Un shard : métadonnées + index trié par fitness, sous un seul verrou (toujours cohérents).
 pub struct Shard {
-    /// Maps genome_id → genome (peut être None si pas en mémoire)
-    genomes: RwLock<HashMap<GenomeId, Option<Genome>>>,
-    /// Index fitness trié
-    fitness_index: RwLock<BTreeMap<FitnessScore, Vec<GenomeId>>>,
-    /// Index générationnel
-    generation_index: RwLock<Vec<GenomeId>>,
+    inner: RwLock<ShardInner>,
 }
 
 impl Shard {
+    /// Crée un shard vide.
     pub fn new() -> Self {
         Self {
-            genomes: RwLock::new(HashMap::new()),
-            fitness_index: RwLock::new(BTreeMap::new()),
-            generation_index: RwLock::new(Vec::new()),
+            inner: RwLock::new(ShardInner {
+                metas: HashMap::new(),
+                by_fitness: BTreeSet::new(),
+            }),
         }
     }
-    
-    /// Insère un genome dans le shard
-    pub fn insert(&self, genome: Genome) {
-        let fitness = genome.fitness;
-        let genome_id = genome.id;
-        let generation = genome.generation as usize;
-        
-        self.genomes.write().insert(genome_id, Some(genome));
-        self.fitness_index.write()
-            .entry(fitness)
-            .or_insert_with(Vec::new)
-            .push(genome_id);
-        
-        let mut gen_idx = self.generation_index.write();
-        if generation >= gen_idx.len() {
-            gen_idx.resize(generation + 1, 0);
+
+    /// Insère ou remplace les métadonnées d'un genome.
+    pub fn upsert(&self, meta: GenomeMeta) {
+        let mut inner = self.inner.write();
+        if let Some(old) = inner.metas.insert(meta.id, meta) {
+            inner.by_fitness.remove(&(old.fitness, old.id));
         }
-        gen_idx[generation] = genome_id;
+        inner.by_fitness.insert((meta.fitness, meta.id));
     }
-    
-    /// Récupère un genome
-    pub fn get(&self, genome_id: GenomeId) -> Option<Genome> {
-        self.genomes.read()
-            .get(&genome_id)
-            .and_then(|opt| opt.clone())
+
+    /// Récupère les métadonnées d'un genome.
+    pub fn get(&self, genome_id: GenomeId) -> Option<GenomeMeta> {
+        self.inner.read().metas.get(&genome_id).copied()
     }
-    
-    /// Met à jour un genome
-    pub fn update(&self, genome: Genome) {
-        let genome_id = genome.id;
-        let fitness = genome.fitness;
-        
-        // Supprimer l'ancienne entrée dans l'index fitness
-        if let Some(old) = self.genomes.write().insert(genome_id, Some(genome)) {
-            if let Some(old_genome) = old {
-                if let Some(vec) = self.fitness_index.write().get_mut(&old_genome.fitness) {
-                    vec.retain(|&id| id != genome_id);
+
+    /// Supprime un genome de l'index.
+    pub fn remove(&self, genome_id: GenomeId) -> Option<GenomeMeta> {
+        let mut inner = self.inner.write();
+        let old = inner.metas.remove(&genome_id)?;
+        inner.by_fitness.remove(&(old.fitness, old.id));
+        Some(old)
+    }
+
+    /// Les `n` meilleurs genomes du shard, du plus au moins fit.
+    pub fn top_fitness(&self, n: usize) -> Vec<(FitnessScore, GenomeId)> {
+        self.inner.read().by_fitness.iter().rev().take(n).copied().collect()
+    }
+
+    /// Genomes dont la signature est au moins `threshold`-similaire à `target`.
+    pub fn similar(&self, target: GeneticSignature, threshold: f32) -> Vec<(GenomeId, f32)> {
+        self.inner
+            .read()
+            .metas
+            .values()
+            .filter_map(|m| {
+                let s = target.similarity(m.signature);
+                if s >= threshold {
+                    Some((m.id, s))
+                } else {
+                    None
                 }
-            }
-        }
-        
-        // Ajouter la nouvelle entrée
-        self.fitness_index.write()
-            .entry(fitness)
-            .or_insert_with(Vec::new)
-            .push(genome_id);
+            })
+            .collect()
     }
-    
-    /// Supprime un genome
-    pub fn remove(&self, genome_id: GenomeId) -> Option<Genome> {
-        if let Some(genome_opt) = self.genomes.write().remove(&genome_id) {
-            if let Some(genome) = genome_opt {
-                if let Some(vec) = self.fitness_index.write().get_mut(&genome.fitness) {
-                    vec.retain(|&id| id != genome_id);
-                }
-                return Some(genome);
-            }
-        }
-        None
+
+    /// Copie de toutes les métadonnées du shard.
+    pub fn all_metas(&self) -> Vec<GenomeMeta> {
+        self.inner.read().metas.values().copied().collect()
     }
-    
-    /// Retourne les genomes avec le plus haut fitness
-    pub fn top_fitness(&self, n: usize) -> Vec<GenomeId> {
-        let mut result = Vec::new();
-        let fitness_idx = self.fitness_index.read();
-        
-        for (_fitness, ids) in fitness_idx.iter().rev() {
-            for &id in ids {
-                result.push(id);
-                if result.len() >= n {
-                    return result;
-                }
-            }
-        }
-        
-        result
-    }
-    
-    /// Nombre de genomes dans le shard
+
+    /// Nombre de genomes dans le shard.
     pub fn len(&self) -> usize {
-        self.genomes.read().len()
+        self.inner.read().metas.len()
+    }
+
+    /// Vrai si le shard est vide.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 

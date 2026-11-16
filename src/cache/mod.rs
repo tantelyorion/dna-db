@@ -1,4 +1,4 @@
-//! Système de cache pour DNA DB
+//! Cache en mémoire pour DNA DB.
 
 mod lru;
 

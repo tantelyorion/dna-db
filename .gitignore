@@ -1,0 +1,4 @@
+/target
+Cargo.lock
+/test_dna_data
+/dna_data
